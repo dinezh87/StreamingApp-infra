@@ -36,15 +36,26 @@ aws sts get-caller-identity
 
 ---
 
-## Step 1 — Register a Domain in Route 53
+## Step 1 — Delegate DNS from GoDaddy to Route 53
 
-**Why:** Route 53 will be the DNS entry point for all traffic. You need the domain before requesting an ACM certificate.
+**Why:** The domain `streamingapp.online` is registered in GoDaddy. Route 53 will host the DNS zone so AWS can manage all records (ACM validation, CloudFront alias). You do NOT re-register the domain — you only change the nameservers in GoDaddy.
 
-1. Go to **AWS Console → Route 53 → Registered Domains → Register Domain**
-2. Search for `streamingapp.com` (or your chosen domain) and complete purchase
-3. A **Hosted Zone** is automatically created — note the **Hosted Zone ID**, you'll need it in Terraform
+### 1a — Create a Hosted Zone in Route 53
 
-> If you already own a domain elsewhere, create a Hosted Zone manually and update your registrar's nameservers to point to the Route 53 NS records.
+1. Go to **AWS Console → Route 53 → Hosted Zones → Create Hosted Zone**
+2. Domain name: `streamingapp.online`
+3. Type: **Public hosted zone**
+4. Click **Create**
+5. Note the **4 NS records** Route 53 assigns (e.g. `ns-123.awsdns-45.com`)
+
+### 1b — Update Nameservers in GoDaddy
+
+1. Log in to **GoDaddy → My Products → streamingapp.online → DNS**
+2. Click **Nameservers → Change → Enter my own nameservers**
+3. Paste the 4 Route 53 NS records
+4. Save — propagation takes 10–30 minutes
+
+> After this, all DNS for `streamingapp.online` is managed in Route 53. GoDaddy is only the registrar.
 
 ---
 
@@ -55,10 +66,10 @@ aws sts get-caller-identity
 1. Go to **AWS Console → Certificate Manager → Request Certificate**
 2. Choose **Request a public certificate**
 3. Add domain names:
-   - `streamingapp.com`
-   - `*.streamingapp.com`
+   - `streamingapp.online`
+   - `*.streamingapp.online`
 4. Choose **DNS validation** → click **Request**
-5. Click **Create records in Route 53** — AWS automatically adds the CNAME validation records
+5. Click **Create records in Route 53** — AWS automatically adds the CNAME validation records to your hosted zone
 6. Wait ~2 minutes until status shows **Issued**
 7. Note the **Certificate ARN** — used in Terraform for CloudFront and ALB
 
@@ -66,7 +77,7 @@ aws sts get-caller-identity
 
 ## Step 3 — Provision Infrastructure with Terraform
 
-**Why:** Terraform creates all AWS resources (VPC, EKS, ECR, DocumentDB, S3, CloudFront, Secrets Manager, ElastiCache) in a repeatable, version-controlled way.
+**Why:** Terraform creates all AWS resources (VPC, EKS, ECR, MongoDB EC2, S3, CloudFront, Secrets Manager, ElastiCache) in a repeatable, version-controlled way.
 
 ### 3a — Create the S3 backend for Terraform state
 
@@ -80,18 +91,16 @@ aws s3api put-bucket-versioning \
   --versioning-configuration Status=Enabled
 ```
 
-### 3b — Clone or create the infra repository
-
-Use the folder structure from `ARCHITECTURE.md`:
+### 3b — Folder structure
 
 ```
 StreamingApp-infra/
   terraform/
     modules/
-      vpc/
-      eks/
+      VPC/
+      EKS/
       ecr/
-      documentdb/
+      mongodb/
       s3/
       cloudfront/
       secrets/
@@ -105,28 +114,17 @@ StreamingApp-infra/
 
 ### 3c — VPC module
 
-Creates: VPC `10.0.0.0/16`, 6 subnets across 2 AZs, Internet Gateway, 2 NAT Gateways (one per AZ), and route tables.
+Creates: VPC `10.0.0.0/16`, 5 subnets (2 public, 2 private app, 1 private data), Internet Gateway, 2 NAT Gateways, and route tables.
 
 ```hcl
 # terraform/envs/prod/main.tf (excerpt)
 module "vpc" {
-  source             = "../../modules/vpc"
-  vpc_cidr           = "10.0.0.0/16"
-  public_subnets     = ["10.0.1.0/24", "10.0.2.0/24"]
-  private_app_subnets = ["10.0.3.0/24", "10.0.4.0/24"]
-  private_data_subnets = ["10.0.5.0/24", "10.0.6.0/24"]
-  azs                = ["us-east-1a", "us-east-1b"]
+  source                   = "../../modules/VPC"
+  vpc_cidr                 = "10.0.0.0/16"
+  public_subnet_cidrs      = ["10.0.1.0/24", "10.0.2.0/24"]
+  private_app_subnet_cidrs = ["10.0.3.0/24", "10.0.4.0/24"]
+  private_data_subnet_cidr = "10.0.5.0/24"
 }
-```
-
-Tag public subnets for ALB discovery and private subnets for EKS:
-```hcl
-# Public subnets
-"kubernetes.io/role/elb" = "1"
-
-# Private subnets
-"kubernetes.io/role/internal-elb" = "1"
-"kubernetes.io/cluster/streamingapp" = "owned"
 ```
 
 ### 3d — ECR module
@@ -148,35 +146,26 @@ Creates the EKS control plane and a managed node group in the private app subnet
 
 ```hcl
 module "eks" {
-  source          = "../../modules/eks"
-  cluster_name    = "streamingapp"
-  cluster_version = "1.29"
-  subnet_ids      = module.vpc.private_app_subnet_ids
-  node_instance_type = "t3.medium"
-  node_min        = 2
-  node_max        = 6
-  node_desired    = 2
+  source                  = "../../modules/EKS"
+  cluster_name            = "streamingapp"
+  cluster_version         = "1.29"
+  private_app_subnet_ids  = module.vpc.private_app_subnet_ids
+  private_data_subnet_id  = module.vpc.private_data_subnet_id
+  node_instance_type      = "t3.medium"
+  data_node_instance_type = "t3.medium"
+  node_min                = 2
+  node_max                = 6
+  node_desired            = 2
 }
 ```
 
 The module also creates the OIDC provider for IRSA (IAM Roles for Service Accounts).
 
-### 3f — DocumentDB module
+### 3f — MongoDB node group
 
-Creates the DocumentDB cluster in the private data subnets with a security group that only allows port 27017 from EKS node security group:
+The data node group is defined inside the EKS module. It places a single tainted node in the private data subnet. The MongoDB StatefulSet is deployed via Helm in Step 8 and uses a toleration + nodeSelector to land exclusively on this node.
 
-```hcl
-module "documentdb" {
-  source          = "../../modules/documentdb"
-  cluster_id      = "streamingapp-db"
-  instance_class  = "db.r6g.large"
-  instance_count  = 2
-  subnet_ids      = module.vpc.private_data_subnet_ids
-  allowed_sg_id   = module.eks.node_security_group_id
-  master_username = "dbadmin"
-  # password stored in Secrets Manager — not in Terraform
-}
-```
+The EBS CSI driver (installed in Step 5) provides the PersistentVolume backed by an EBS volume.
 
 ### 3g — S3 module
 
@@ -201,7 +190,7 @@ module "secrets" {
   source = "../../modules/secrets"
   secrets = {
     "streamingapp/jwt_secret"    = var.jwt_secret
-    "streamingapp/db_uri"        = "mongodb://<user>:<pass>@<docdb-endpoint>:27017/streamingapp"
+    "streamingapp/db_uri"        = "mongodb://<user>:<pass>@<mongodb-private-ip>:27017/streamingapp"
     "streamingapp/aws_s3_bucket" = "streamingapp-media"
   }
 }
@@ -213,11 +202,11 @@ Creates a Redis cluster for Socket.IO multi-pod session sharing and JWT blacklis
 
 ```hcl
 module "elasticache" {
-  source         = "../../modules/elasticache"
-  cluster_id     = "streamingapp-redis"
-  node_type      = "cache.t3.micro"
-  subnet_ids     = module.vpc.private_data_subnet_ids
-  allowed_sg_id  = module.eks.node_security_group_id
+  source        = "../../modules/elasticache"
+  cluster_id    = "streamingapp-redis"
+  node_type     = "cache.t3.micro"
+  subnet_id     = module.vpc.private_data_subnet_id
+  allowed_sg_id = module.eks.node_security_group_id
 }
 ```
 
@@ -227,11 +216,11 @@ Creates the CloudFront distribution with two origins (S3 via OAC and ALB) and ca
 
 ```hcl
 module "cloudfront" {
-  source          = "../../modules/cloudfront"
-  acm_cert_arn    = var.acm_certificate_arn   # from Step 2
-  s3_bucket_id    = module.s3.bucket_id
-  alb_dns_name    = module.eks.alb_dns_name   # filled after Step 6
-  domain_name     = "streamingapp.com"
+  source       = "../../modules/cloudfront"
+  acm_cert_arn = var.acm_certificate_arn   # from Step 2
+  s3_bucket_id = module.s3.bucket_id
+  alb_dns_name = module.eks.alb_dns_name   # filled after Step 6
+  domain_name  = "streamingapp.online"
 }
 ```
 
@@ -253,7 +242,7 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
-Save the outputs — you'll need ECR URIs, EKS cluster name, DocumentDB endpoint, and Redis endpoint in later steps.
+Save the outputs — you'll need ECR URIs, EKS cluster name, MongoDB private IP, and Redis endpoint in later steps.
 
 ---
 
@@ -363,13 +352,13 @@ aws ecr get-login-password --region us-east-1 | \
 ECR_BASE=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/streamingapp
 GIT_SHA=$(git rev-parse --short HEAD)
 
-# Build and push each service
-for SERVICE in auth streaming admin chat frontend; do
+# Build and push each backend service
+for SERVICE in auth streaming admin chat; do
   docker build -t $ECR_BASE/$SERVICE:$GIT_SHA ./backend/${SERVICE}Service
   docker push $ECR_BASE/$SERVICE:$GIT_SHA
 done
 
-# Frontend is in a different path
+# Frontend
 docker build -t $ECR_BASE/frontend:$GIT_SHA ./frontend
 docker push $ECR_BASE/frontend:$GIT_SHA
 ```
@@ -386,7 +375,39 @@ docker push $ECR_BASE/frontend:$GIT_SHA
 kubectl create namespace streamingapp
 ```
 
-### 8b — Create a Kubernetes Secret for DocumentDB credentials
+### 8b — Deploy MongoDB as a StatefulSet
+
+MongoDB runs as a Kubernetes StatefulSet on the data node group. The toleration and nodeSelector ensure it only lands on the tainted data node:
+
+```yaml
+# helm/streamingapp/templates/mongodb/statefulset.yaml
+spec:
+  template:
+    spec:
+      tolerations:
+        - key: "workload"
+          value: "database"
+          effect: "NoSchedule"
+      nodeSelector:
+        workload: database
+      containers:
+        - name: mongodb
+          image: mongo:6
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: gp2
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+```
+
+### 8c — Create a Kubernetes Secret for MongoDB credentials
 
 Pull the connection string from Secrets Manager and create a Kubernetes Secret:
 
@@ -410,7 +431,7 @@ global:
   imageTag: <GIT_SHA>
   region: us-east-1
   s3Bucket: streamingapp-media
-  cdnUrl: https://streamingapp.com
+  cdnUrl: https://streamingapp.online
 
 auth:
   replicas: 2
@@ -434,12 +455,10 @@ frontend:
 
 ingress:
   certificateArn: <ACM_CERT_ARN>
-  host: streamingapp.com
+  host: streamingapp.online
 ```
 
 ### 8d — Ingress manifest (ALB annotations)
-
-The Ingress resource tells the AWS Load Balancer Controller to create the ALB with path-based routing:
 
 ```yaml
 # helm/streamingapp/templates/ingress.yaml
@@ -507,13 +526,13 @@ kubectl get ingress -n streamingapp
 
 ## Step 9 — Point Route 53 to CloudFront
 
-**Why:** Users reach the app via `streamingapp.com`. Route 53 must resolve this to the CloudFront distribution, which then routes to S3 or the ALB.
+**Why:** Users reach the app via `streamingapp.online`. Route 53 must resolve this to the CloudFront distribution, which then routes to S3 or the ALB.
 
-1. Go to **Route 53 → Hosted Zones → streamingapp.com**
+1. Go to **Route 53 → Hosted Zones → streamingapp.online**
 2. Create an **A record (Alias)**:
-   - Record name: `streamingapp.com`
+   - Record name: `streamingapp.online`
    - Alias target: your **CloudFront distribution domain** (e.g. `d1abc123.cloudfront.net`)
-3. Create another **A record (Alias)** for `www.streamingapp.com` pointing to the same CloudFront distribution
+3. Create another **A record (Alias)** for `www.streamingapp.online` pointing to the same CloudFront distribution
 
 > The ALB DNS name from Step 8e is used as the ALB origin inside CloudFront — it is NOT exposed directly to users.
 
@@ -586,8 +605,6 @@ In Jenkins → Manage Credentials, add:
 
 ### 11c — Jenkinsfile
 
-Place this at the repo root. It detects which service changed, builds only that image, scans it, pushes to ECR, and bumps the image tag in the GitOps repo:
-
 ```groovy
 pipeline {
   agent any
@@ -641,15 +658,9 @@ aws eks create-addon \
   --addon-name amazon-cloudwatch-observability
 ```
 
-This deploys the CloudWatch agent as a DaemonSet and automatically collects:
-- Pod CPU and memory metrics
-- Container stdout/stderr logs (viewable in CloudWatch Log Groups)
-- Node-level metrics
-
 ### Create alarms
 
 ```bash
-# Example: alarm if any pod's CPU exceeds 80% for 5 minutes
 aws cloudwatch put-metric-alarm \
   --alarm-name "streamingapp-high-cpu" \
   --metric-name pod_cpu_utilization \
@@ -667,8 +678,8 @@ aws cloudwatch put-metric-alarm \
 
 Verify the full stack end-to-end:
 
-1. Open `https://streamingapp.com` — React app loads (CloudFront → ALB → frontend pod)
-2. Register a new user account — (ALB → auth pod → DocumentDB)
+1. Open `https://streamingapp.online` — React app loads (CloudFront → ALB → frontend pod)
+2. Register a new user account — (ALB → auth pod → MongoDB)
 3. Log in as admin, open the Upload page, upload a small video and thumbnail — (ALB → admin pod → presigned S3 URL → S3 direct upload)
 4. Browse to the video on the main page — thumbnail loads from CloudFront/S3 edge cache
 5. Click Play — video streams (CloudFront → ALB → streaming pod → S3 range request)
@@ -680,9 +691,9 @@ Verify the full stack end-to-end:
 
 | Step | What | Why it must come first |
 |---|---|---|
-| 1 | Route 53 domain | Needed before ACM validation |
+| 1 | GoDaddy → Route 53 NS delegation | Needed before ACM DNS validation can complete |
 | 2 | ACM certificate | Needed before CloudFront and ALB HTTPS |
-| 3 | Terraform (VPC → ECR → EKS → DB → S3 → CF) | All infrastructure before any workloads |
+| 3 | Terraform (VPC → ECR → EKS → MongoDB → S3 → CF) | All infrastructure before any workloads |
 | 4 | kubectl config | Needed before any `kubectl` or `helm` commands |
 | 5 | EKS add-ons | Load Balancer Controller must exist before Ingress creates the ALB |
 | 6 | IRSA roles | Must exist before pods start — pods assume roles at startup |
